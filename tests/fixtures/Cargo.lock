@@ -14,3 +14,8 @@ version = "2.3.4"
 name = "totally-legit-crate"
 version = "0.1.0"
 source = "registry+https://crates.example.invalid/index"
+
+[[package]]
+name = "second-crate-added-after-approval"
+version = "0.1.0"
+source = "registry+https://crates.example.invalid/index"
