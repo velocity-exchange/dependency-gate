@@ -160,7 +160,10 @@ runs:
           # absent path all look alike, and reading any of them as "nothing was added"
           # would open the gate. So existence is decided here, once, and anything wrong
           # with this listing fails the job.
-          gh api "repos/$REPO/git/trees/$HEAD_SHA?recursive=1" > "$work/tree.json"
+          if ! gh api "repos/$REPO/git/trees/$HEAD_SHA?recursive=1" > "$work/tree.json"; then
+            echo "::error::Could not list the head tree at $HEAD_SHA. The token needs 'contents: read', and the head commit must be reachable from this repository. Refusing to continue, because an unreadable listing must not be read as 'nothing was added'."
+            exit 1
+          fi
           if [ "$(jq -r '.truncated' "$work/tree.json")" != "false" ]; then
             echo "::error::The head tree listing was truncated, so which lockfiles exist cannot be established."
             exit 1
@@ -181,10 +184,14 @@ runs:
             if grep -qxF "$lock" "$work/head-paths.txt"; then
               mkdir -p "$work/head/$(dirname "$lock")"
               # Read as bytes at a pinned SHA. None of the pull request's commits enter
-              # the checkout, so there is nothing of the pull request's to execute. A
-              # failure here is fatal, by set -e.
-              gh api "repos/$REPO/contents/$lock?ref=$HEAD_SHA" \
-                -H "Accept: application/vnd.github.raw" > "$work/head/$lock"
+              # the checkout, so there is nothing of the pull request's to execute.
+              # The tree listing above already said this path exists, so a failure here
+              # is a real problem and never an absent file.
+              if ! gh api "repos/$REPO/contents/$lock?ref=$HEAD_SHA" \
+                  -H "Accept: application/vnd.github.raw" > "$work/head/$lock"; then
+                echo "::error::Could not read '$lock' at $HEAD_SHA even though the head tree lists it. Refusing to treat that as 'nothing was added'."
+                exit 1
+              fi
               head_copy="$work/head/$lock"
             fi
           elif [ -f "$lock" ]; then
