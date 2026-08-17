@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  # Only the dogfood-prt job below uses this. Under pull_request_target the workflow,
+  # and `uses: ./`, both come from the base branch, so this exercises the base branch's
+  # action rather than the pull request's. That is the point of the mode.
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -12,6 +17,8 @@ permissions:
 jobs:
   parser:
     name: Parser tests
+    # Must run the pull request's own code, so not under pull_request_target.
+    if: github.event_name != 'pull_request_target'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -19,25 +26,36 @@ jobs:
 
   action-yml:
     name: action.yml is valid
+    if: github.event_name != 'pull_request_target'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Parse action.yml and check the declared contract
         run: |
           python3 - <<'PY'
+          import re
           import yaml
           d = yaml.safe_load(open("action.yml"))
           assert d["runs"]["using"] == "composite", d["runs"]["using"]
           assert "lockfiles" in d["inputs"], "lockfiles input missing"
           assert d["inputs"]["lockfiles"]["required"] is True
-          assert set(d["outputs"]) == {"count", "packages"}, set(d["outputs"])
+          assert set(d["outputs"]) == {"count", "digest", "findings"}, set(d["outputs"])
           for step in d["runs"]["steps"]:
               assert step.get("shell") == "bash", step.get("name")
-          print(f'ok: {len(d["runs"]["steps"])} composite steps')
+          # Every Actions expression must arrive through env:, never interpolated into
+          # a run: body, where a crafted value would be pasted straight into bash.
+          leaked = [
+              (step["name"], m)
+              for step in d["runs"]["steps"]
+              for m in re.findall(r"\$\{\{[^}]*\}\}", step.get("run") or "")
+          ]
+          assert not leaked, f"expressions interpolated into run bodies: {leaked}"
+          print(f'ok: {len(d["runs"]["steps"])} composite steps, no leaked expressions')
           PY
 
   shell:
     name: Shellcheck the composite steps
+    if: github.event_name != 'pull_request_target'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -61,13 +79,13 @@ jobs:
           # SC2086 is noisy here: $LOCKFILES is intentionally word-split.
           shellcheck --severity=warning --exclude=SC2086 shell-blocks/*.sh
 
-  dogfood:
-    name: Gate this repository with itself
-    # Only meaningful on a pull request: that is the event the action gates.
+  dogfood-pr:
+    name: Gate this repository with itself (pull_request mode)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      issues: write
       pull-requests: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -76,11 +94,48 @@ jobs:
       - id: gate
         uses: ./
         with:
-          lockfiles: tests/fixtures/Cargo.lock
+          # The stable fixtures never change, so this job stays green. The gate's
+          # failure path is exercised by .github/workflows/dependency-gate.yml, which
+          # watches tests/fixtures/Cargo.lock.
+          lockfiles: tests/fixtures/stable/Cargo.lock tests/fixtures/stable/uv.lock
           comment: "false"
-      - name: The fixture is unchanged, so the count must be zero
+      - name: The stable fixtures are unchanged, so the count must be zero
         env:
           COUNT: ${{ steps.gate.outputs.count }}
+          DIGEST: ${{ steps.gate.outputs.digest }}
         run: |
+          set -euo pipefail
           test "$COUNT" = "0" || { echo "expected count=0, got '$COUNT'"; exit 1; }
-          echo "ok"
+          test -n "$DIGEST" || { echo "expected a digest to be reported"; exit 1; }
+          echo "ok: count=$COUNT digest=$DIGEST"
+
+  dogfood-prt:
+    name: Gate this repository with itself (pull_request_target mode)
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      # Checks out the base branch, which is what pull_request_target resolves to. The
+      # pull request's own files are never checked out; the gate reads its lockfiles
+      # through the contents API at a pinned head SHA.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - id: gate
+        uses: ./
+        with:
+          lockfiles: tests/fixtures/stable/Cargo.lock tests/fixtures/stable/uv.lock
+          comment: "false"
+          require-pull-request-target: "true"
+      - name: The stable fixtures are unchanged, so the count must be zero
+        env:
+          COUNT: ${{ steps.gate.outputs.count }}
+          DIGEST: ${{ steps.gate.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test "$COUNT" = "0" || { echo "expected count=0, got '$COUNT'"; exit 1; }
+          test -n "$DIGEST" || { echo "expected a digest to be reported"; exit 1; }
+          echo "ok: count=$COUNT digest=$DIGEST"
