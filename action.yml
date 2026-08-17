@@ -1,0 +1,190 @@
+name: Dependency gate
+description: >
+  Flag dependencies a pull request newly introduces, and require an explicit
+  human sign-off label before it can merge.
+author: velocity-exchange
+
+branding:
+  icon: package
+  color: green
+
+inputs:
+  lockfiles:
+    description: >
+      Space-separated, repo-relative lockfile paths to watch. Supported names:
+      bun.lock, yarn.lock, pnpm-lock.yaml, Cargo.lock, uv.lock.
+    required: true
+  label:
+    description: Label that records human sign-off on the newly added packages.
+    required: false
+    default: deps-reviewed
+  comment:
+    description: Post or update a sticky comment listing the new packages.
+    required: false
+    default: "true"
+  token:
+    description: Token used to read labels and write the sticky comment.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  count:
+    description: Number of newly added packages.
+    value: ${{ steps.collect.outputs.count }}
+  packages:
+    description: Tab-separated "lockfile<TAB>package" lines, one per new package.
+    value: ${{ steps.collect.outputs.packages }}
+
+runs:
+  using: composite
+  steps:
+    # The parser lives inside this action, not in the calling repository, so a
+    # pull request cannot weaken the check that is inspecting it.
+    - name: Resolve the base revision
+      id: base
+      shell: bash
+      env:
+        EVENT: ${{ github.event_name }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+      run: |
+        set -euo pipefail
+        resolve() { git rev-parse --verify --quiet "$1^{commit}"; }
+
+        base=""
+        if [ "$EVENT" = "pull_request" ] || [ "$EVENT" = "pull_request_target" ]; then
+          # Prefer the exact SHA from the event payload; fall back to the remote
+          # branch when the object is missing from a partial fetch.
+          base=$(resolve "$BASE_SHA" || resolve "origin/$GITHUB_BASE_REF" || true)
+        elif [ -n "${PUSH_BEFORE:-}" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+          base=$(resolve "$PUSH_BEFORE" || true)
+        fi
+
+        if [ -z "$base" ]; then
+          echo "::error::Could not resolve a base revision to compare against. Check out with 'fetch-depth: 0' so the base commit is present."
+          exit 1
+        fi
+        echo "base=$base" >> "$GITHUB_OUTPUT"
+        echo "Comparing against $base"
+
+    - name: Collect newly added packages
+      id: collect
+      shell: bash
+      env:
+        LOCKFILES: ${{ inputs.lockfiles }}
+        BASE: ${{ steps.base.outputs.base }}
+      run: |
+        set -euo pipefail
+        parser="$GITHUB_ACTION_PATH/lockfile_packages.py"
+        work=$(mktemp -d)
+        : > "$work/new.tsv"
+
+        seen=0
+        for lock in $LOCKFILES; do
+          if [ ! -f "$lock" ]; then
+            echo "::warning::Watched lockfile '$lock' is not present; skipping."
+            continue
+          fi
+          seen=$((seen + 1))
+          # Mirror the path so the base copy keeps its filename, which is how the
+          # parser picks a format.
+          mkdir -p "$work/base/$(dirname "$lock")"
+          git show "$BASE:$lock" > "$work/base/$lock" 2>/dev/null \
+            || : > "$work/base/$lock"
+          python3 "$parser" "$work/base/$lock" "$lock" \
+            | awk -v lock="$lock" '{print lock "\t" $0}' >> "$work/new.tsv"
+        done
+
+        if [ "$seen" -eq 0 ]; then
+          echo "::error::None of the watched lockfiles exist. Check the 'lockfiles' input."
+          exit 1
+        fi
+
+        count=$(wc -l < "$work/new.tsv" | tr -d ' ')
+        echo "count=$count" >> "$GITHUB_OUTPUT"
+        {
+          echo "packages<<__EOF__"
+          cat "$work/new.tsv"
+          echo "__EOF__"
+        } >> "$GITHUB_OUTPUT"
+        echo "tsv=$work/new.tsv" >> "$GITHUB_OUTPUT"
+        echo "Newly added packages: $count"
+        cat "$work/new.tsv"
+
+    - name: Report and enforce
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        COUNT: ${{ steps.collect.outputs.count }}
+        TSV: ${{ steps.collect.outputs.tsv }}
+        LABEL: ${{ inputs.label }}
+        WANT_COMMENT: ${{ inputs.comment }}
+        EVENT: ${{ github.event_name }}
+        PR: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        MARKER: "<!-- velocity-dependency-gate -->"
+      run: |
+        set -euo pipefail
+
+        body=$(mktemp)
+        {
+          echo "$MARKER"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "### No new dependencies"
+            echo
+            echo "Every package in the watched lockfiles was already present on the base branch."
+          else
+            echo "### New dependencies in this pull request"
+            echo
+            echo "Confirm each package's **source, maintainer and integrity**, then apply the"
+            echo "\`$LABEL\` label to merge."
+            echo
+            echo '| Lockfile | Package |'
+            echo '| --- | --- |'
+            awk -F'\t' '{print "| `" $1 "` | `" $2 "` |"}' "$TSV"
+          fi
+        } > "$body"
+
+        # Outside a pull request there is nothing to label or comment on, so
+        # record the result and never fail the run.
+        if [ "$EVENT" != "pull_request" ] && [ "$EVENT" != "pull_request_target" ]; then
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+          echo "Not a pull request; reported to the job summary only."
+          exit 0
+        fi
+
+        if [ "$WANT_COMMENT" = "true" ]; then
+          # Keep one sticky comment rather than one per push. Read every page so
+          # an older marker is still found on a busy pull request.
+          existing=""
+          mapfile -t ids < <(
+            gh api --paginate "repos/$REPO/issues/$PR/comments" \
+              --jq ".[] | select(.body != null and (.body | contains(\"$MARKER\"))) | .id" || true
+          )
+          existing="${ids[0]:-}"
+
+          # A fork pull request gets a read-only token, so commenting can fail.
+          # That must not stop enforcement below from running.
+          if [ -n "$existing" ]; then
+            gh api --method PATCH "repos/$REPO/issues/comments/$existing" -F body=@"$body" --silent \
+              || echo "::warning::Could not update the gate comment; continuing."
+          else
+            gh api --method POST "repos/$REPO/issues/$PR/comments" -F body=@"$body" --silent \
+              || echo "::warning::Could not post the gate comment; continuing."
+          fi
+        fi
+
+        if [ "$COUNT" -eq 0 ]; then
+          echo "No new dependencies."
+          exit 0
+        fi
+
+        # Read labels from the API rather than the event payload: the payload is a
+        # snapshot from when the run started, and an exact line match avoids any
+        # ambiguity with similarly named labels.
+        if gh api "repos/$REPO/issues/$PR/labels" --jq '.[].name' | grep -Fxq "$LABEL"; then
+          echo "::notice::$COUNT new package(s), signed off via the '$LABEL' label."
+        else
+          echo "::error::$COUNT new package(s) need review. Apply the '$LABEL' label to merge."
+          exit 1
+        fi

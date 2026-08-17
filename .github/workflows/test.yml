@@ -1,0 +1,83 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  parser:
+    name: Parser tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - run: python3 tests/test_parser.py
+
+  action-yml:
+    name: action.yml is valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Parse action.yml and check the declared contract
+        run: |
+          python3 - <<'PY'
+          import yaml
+          d = yaml.safe_load(open("action.yml"))
+          assert d["runs"]["using"] == "composite", d["runs"]["using"]
+          assert "lockfiles" in d["inputs"], "lockfiles input missing"
+          assert d["inputs"]["lockfiles"]["required"] is True
+          assert set(d["outputs"]) == {"count", "packages"}, set(d["outputs"])
+          for step in d["runs"]["steps"]:
+              assert step.get("shell") == "bash", step.get("name")
+          print(f'ok: {len(d["runs"]["steps"])} composite steps')
+          PY
+
+  shell:
+    name: Shellcheck the composite steps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Extract each run block and shellcheck it
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, re, yaml
+          d = yaml.safe_load(open("action.yml"))
+          out = pathlib.Path("shell-blocks"); out.mkdir(exist_ok=True)
+          for i, step in enumerate(d["runs"]["steps"]):
+              script = step.get("run")
+              if not script:
+                  continue
+              # Actions expressions are substituted before bash sees them; replace
+              # them with a placeholder so shellcheck parses the real structure.
+              script = re.sub(r"\$\{\{[^}]*\}\}", "PLACEHOLDER", script)
+              (out / f"step{i}.sh").write_text("#!/usr/bin/env bash\n" + script)
+          PY
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC2086 is noisy here: $LOCKFILES is intentionally word-split.
+          shellcheck --severity=warning --exclude=SC2086 shell-blocks/*.sh
+
+  dogfood:
+    name: Gate this repository with itself
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - id: gate
+        uses: ./
+        with:
+          lockfiles: tests/fixtures/Cargo.lock
+          comment: "false"
+      - name: The fixture is unchanged, so the count must be zero
+        env:
+          COUNT: ${{ steps.gate.outputs.count }}
+        run: |
+          test "$COUNT" = "0" || { echo "expected count=0, got '$COUNT'"; exit 1; }
+          echo "ok"
