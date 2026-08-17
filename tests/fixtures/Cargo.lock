@@ -9,3 +9,8 @@ version = "1.0.0"
 [[package]]
 name = "another-crate"
 version = "2.3.4"
+
+[[package]]
+name = "totally-legit-crate"
+version = "0.1.0"
+source = "registry+https://crates.example.invalid/index"
