@@ -62,6 +62,8 @@ jobs:
 
   dogfood:
     name: Gate this repository with itself
+    # Only meaningful on a pull request: that is the event the action gates.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read

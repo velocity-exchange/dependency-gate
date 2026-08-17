@@ -61,14 +61,24 @@ runs:
         fi
 
         if [ -z "$base" ]; then
-          echo "::error::Could not resolve a base revision to compare against. Check out with 'fetch-depth: 0' so the base commit is present."
-          exit 1
+          if [ "$EVENT" = "pull_request" ] || [ "$EVENT" = "pull_request_target" ]; then
+            # On a pull request the base is always knowable, so this is a
+            # misconfiguration and must not pass quietly.
+            echo "::error::Could not resolve the base revision. Check out with 'fetch-depth: 0' so the base commit is present."
+            exit 1
+          fi
+          # Elsewhere there may genuinely be no predecessor: a new branch, the
+          # first push, or a force push. Nothing to diff, so skip.
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "No base revision to compare against; skipping."
+          exit 0
         fi
         echo "base=$base" >> "$GITHUB_OUTPUT"
         echo "Comparing against $base"
 
     - name: Collect newly added packages
       id: collect
+      if: steps.base.outputs.skip != 'true'
       shell: bash
       env:
         LOCKFILES: ${{ inputs.lockfiles }}
@@ -112,6 +122,7 @@ runs:
         cat "$work/new.tsv"
 
     - name: Report and enforce
+      if: steps.base.outputs.skip != 'true'
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.token }}
